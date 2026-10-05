@@ -11,7 +11,9 @@ Este README explica cómo se localizan sobre el eje en QGIS los 13.674,5 m² de 
 | `tabla_proyecto_km_carril.csv` | Medición del proyecto por km y carril, junto con la estadística de deflexiones de ese km |
 | `zonas_fresado_propuestas.csv` | 114 zonas propuestas (pk_ini, pk_fin, ancho), con 13.675 m² en total |
 | `generar_zonas.py` | Genera las zonas a partir de los CSV |
-| `crear_capas_qgis.py` | Script para la consola de Python de QGIS: con vuestro eje crea un GeoPackage con puntos, polígonos, tramos e hitos |
+| `crear_capas_qgis.py` | Script para la consola de Python de QGIS. Con vuestro eje crea el GeoPackage con estilos, un grupo de capas, la composición de planos con atlas y el PDF de planos |
+| `listado_campo_fresado_HU5401.pdf` | Listado para imprimir (A4, 5 páginas): zonas por km con casillas OK y una columna para ajustes y observaciones |
+| `listado_campo.py` | Genera el listado anterior |
 | `perfil_deflexiones_zonas.png` | Perfil de deflexiones con las zonas propuestas |
 
 ## Uso en QGIS
@@ -21,7 +23,14 @@ Este README explica cómo se localizan sobre el eje en QGIS los 13.674,5 m² de 
    * `EJE`: nombre de la capa del eje.
    * `INVERTIR_EJE`: el PK 0+000 está en Puebla de Guzmán. Si el eje está digitalizado al revés, ponlo a `True`.
    * Calibración: se recomienda una **capa de puntos de hitos** con su PK (`HITOS_CAPA`). Si el eje ya tiene valores M, puedes usar `USAR_M`. Si no hay ninguna de las dos, el PK se calcula como la distancia sobre el eje.
-3. Ejecuta el script. Comprueba que la capa `hitos_calculados` coincide con los hitos de la ortofoto (planos 4.x del proyecto).
+3. Ejecuta el script. Al terminar tendrás:
+   * **El grupo "HU-5401 fresado"** con las capas ya simbolizadas y etiquetadas: hitos, PK cada 100 m, zonas de fresado (rojo para el carril D y naranja para el I), deflexiones por rangos con los puntos singulares marcados con estrella, y hojas de planos. Los estilos van guardados dentro del GeoPackage.
+   * **La ortofoto PNOA** (WMS del IGN) por debajo, si no tenías ya una capa llamada "PNOA".
+   * **La composición "Planos fresado HU-5401"** (Proyecto > Composiciones). Es un atlas A3 apaisado de 35 hojas de 500 m, aproximadamente a 1:1.350. Cada hoja va girada para que la carretera quede horizontal con el PK creciente hacia la derecha. Incluye la tabla de zonas de la hoja con columnas para apuntar en campo, un mapa de situación, la leyenda, el resumen de la medición del proyecto, la escala y el norte.
+   * **El PDF de planos** `planos_fresado_HU5401.pdf`, junto al GeoPackage.
+4. Comprueba que los hitos calculados caen sobre los hitos reales de la ortofoto. Si no coinciden, calibra con una capa de hitos (`HITOS_CAPA`) y vuelve a ejecutar el script.
+
+Los campos `comprobado`, `estado_campo` y `obs` de las zonas están vacíos para rellenarlos en campo, por ejemplo con QField, o a mano sobre el plano impreso.
 
 Se ha probado con QGIS 3.34 y un eje sintético. Los carriles quedan en el lado correcto, las geometrías son válidas y el área de las zonas cuadra con la medición.
 

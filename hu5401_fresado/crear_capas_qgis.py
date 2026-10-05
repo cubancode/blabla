@@ -8,6 +8,11 @@ sección CONFIGURACIÓN y ejecutar. Genera un GeoPackage con:
   - zonas_fresado         polígonos propuestos (tabla zonas_fresado_propuestas.csv)
   - tramos_proyecto       km/carril con la medición del proyecto (líneas)
   - hitos_calculados      dónde cae cada hito según la calibración (para comprobar)
+  - hojas_planos          hojas del atlas (cada HOJA_M metros)
+  - marcas_pk_100m        marcas de PK cada 100 m
+y, si CREAR_PLANOS, una composición de impresión con atlas (una hoja por tramo,
+con la tabla de zonas para apuntar en campo) y su exportación a PDF.
+Los estilos quedan guardados dentro del GeoPackage.
 
 Referencia de PK: los PK de las tablas son PK de HITO (los "PK de obra" del
 informe HWD ya se han convertido con las marcas de hito del propio ensayo).
@@ -21,10 +26,16 @@ from qgis.core import (
     QgsFeature, QgsField, QgsFields, QgsGeometry, QgsPointXY, QgsProject,
     QgsVectorFileWriter, QgsVectorLayer, QgsWkbTypes, QgsCoordinateTransformContext,
     QgsGraduatedSymbolRenderer, QgsRendererRange, QgsSymbol, QgsCategorizedSymbolRenderer,
-    QgsRendererCategory,
+    QgsRendererCategory, QgsRuleBasedRenderer, QgsPalLayerSettings, QgsTextFormat,
+    QgsTextBufferSettings, QgsTextBackgroundSettings, QgsVectorLayerSimpleLabeling,
+    QgsRasterLayer, QgsPrintLayout, QgsLayoutItemPage, QgsLayoutItemMap, QgsLayoutItemLabel,
+    QgsLayoutItemLegend, QgsLayoutItemScaleBar, QgsLayoutItemAttributeTable, QgsLayoutFrame,
+    QgsLayoutTableColumn, QgsLayoutPoint, QgsLayoutSize, QgsUnitTypes, QgsLayoutExporter,
+    QgsFillSymbol, QgsMarkerSymbol, QgsLineSymbol, QgsLayoutObject, QgsProperty,
+    QgsLayoutItemPicture, QgsLegendStyle,
 )
-from qgis.PyQt.QtCore import QVariant
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtCore import QVariant, Qt, QSizeF
+from qgis.PyQt.QtGui import QColor, QFont
 
 # ----------------------------------------------------------------------------
 # CONFIGURACIÓN
@@ -54,6 +65,13 @@ ANCHO_CARRIL = 3.50
 #  'eje'      -> desde el eje hacia fuera
 FRANJA_DESDE = 'exterior'
 PASO_M = 2.0                # densificación de los polígonos
+
+# Planos
+CREAR_PLANOS = True         # composición con atlas + PDF
+HOJA_M = 500                # longitud de carretera por hoja (m). 500 m ≈ 1:1.350 en A3
+FORMATO = 'A3'              # 'A3' o 'A4' (apaisado)
+ANADIR_PNOA = True          # añade la ortofoto PNOA (WMS del IGN) si no hay una capa 'PNOA'
+EXPORTAR_PDF = True         # <CARPETA>/planos_fresado_HU5401.pdf
 
 
 # ----------------------------------------------------------------------------
@@ -188,25 +206,294 @@ def _guardar(lyr, gpkg, nombre, primera):
     return QgsVectorLayer(f'{gpkg}|layername={nombre}', nombre, 'ogr')
 
 
-def _estilos(defl, zonas):
-    rangos = [(0, 100, '#1a9850', '< 100'), (100, 120, '#fee08b', '100-120'),
-              (120, 150, '#fc8d59', '120-150'), (150, 999, '#d73027', '≥ 150')]
-    rr = []
-    for lo, hi, col, et in rangos:
-        s = QgsSymbol.defaultSymbol(defl.geometryType())
-        s.setColor(QColor(col))
-        s.setSize(2.2)
-        rr.append(QgsRendererRange(lo, hi, s, et))
-    defl.setRenderer(QgsGraduatedSymbolRenderer('deflexion', rr))
+def _pk(pk):
+    m = int(round(pk * 1000))
+    return f'{m // 1000}+{m % 1000:03d}'
+
+
+def _num(x, dec=1):
+    return f'{x:,.{dec}f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+
+
+def _etiquetas(lyr, expr, size=8, color='#0b0b0b', fondo=None, placement=None, escala_max=None):
+    pal = QgsPalLayerSettings()
+    pal.fieldName = expr
+    pal.isExpression = True
+    if placement is not None:
+        pal.placement = placement
+    fmt = QgsTextFormat()
+    f = QFont('Arial')
+    f.setBold(True)
+    fmt.setFont(f)
+    fmt.setSize(size)
+    fmt.setColor(QColor(color))
+    buf = QgsTextBufferSettings()
+    buf.setEnabled(True)
+    buf.setSize(0.8)
+    buf.setColor(QColor('white'))
+    fmt.setBuffer(buf)
+    if fondo:
+        bg = QgsTextBackgroundSettings()
+        bg.setEnabled(True)
+        bg.setFillColor(QColor(fondo))
+        bg.setStrokeColor(QColor('#0b0b0b'))
+        bg.setStrokeWidth(0.2)
+        bg.setSizeType(QgsTextBackgroundSettings.SizeBuffer)
+        bg.setSize(QSizeF(1.0, 0.6))
+        fmt.setBackground(bg)
+        buf.setEnabled(False)
+        fmt.setBuffer(buf)
+    pal.setFormat(fmt)
+    if escala_max:
+        pal.scaleVisibility = True
+        pal.minimumScale = escala_max      # no etiquetar más allá de 1:escala_max
+        pal.maximumScale = 0
+    lyr.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+    lyr.setLabelsEnabled(True)
+
+
+def _estilos(defl, zonas, tramos, hitos, hojas):
+    # Deflexiones: reglas por rango + puntos singulares destacados
+    raiz = QgsRuleBasedRenderer.Rule(None)
+    for lo, hi, col, et in ((0, 100, '#1a9850', 'Deflexión < 100'),
+                            (100, 120, '#fee08b', 'Deflexión 100–120'),
+                            (120, 150, '#fc8d59', 'Deflexión 120–150'),
+                            (150, 999, '#d73027', 'Deflexión ≥ 150')):
+        sym = QgsMarkerSymbol.createSimple({'name': 'circle', 'color': col, 'size': '1.8',
+                                            'outline_color': '#404040', 'outline_width': '0.1'})
+        raiz.appendChild(QgsRuleBasedRenderer.Rule(
+            sym, filterExp=f'"deflexion" >= {lo} AND "deflexion" < {hi}', label=et))
+    sym = QgsMarkerSymbol.createSimple({'name': 'star', 'color': '#d73027', 'size': '4.5',
+                                        'outline_color': '#000000', 'outline_width': '0.3'})
+    raiz.appendChild(QgsRuleBasedRenderer.Rule(sym, filterExp='"singular_gya" = 1',
+                                               label='Punto singular (informe GYA)'))
+    defl.setRenderer(QgsRuleBasedRenderer(raiz))
+    _etiquetas(defl, 'CASE WHEN "singular_gya" = 1 THEN "pk_txt" || \'  (\' || "deflexion" || \')\' END',
+               size=7, color='#a50026')
+
+    # Zonas de fresado
     cats = []
-    for val, col, et in (('D', '#e31a1c', 'Carril D (sentido creciente)'),
-                         ('I', '#6a3d9a', 'Carril I (sentido decreciente)')):
-        s = QgsSymbol.defaultSymbol(zonas.geometryType())
+    for val, col, et in (('D', '#e31a1c', 'Fresado carril D (→ Paymogo)'),
+                         ('I', '#ff7f00', 'Fresado carril I (→ Puebla de Guzmán)')):
         c = QColor(col)
-        c.setAlpha(140)
-        s.setColor(c)
-        cats.append(QgsRendererCategory(val, s, et))
+        c.setAlpha(150)
+        sym = QgsFillSymbol.createSimple({'color': f'{c.red()},{c.green()},{c.blue()},150',
+                                          'outline_color': col, 'outline_width': '0.5'})
+        cats.append(QgsRendererCategory(val, sym, et))
     zonas.setRenderer(QgsCategorizedSymbolRenderer('carril', cats))
+    _etiquetas(zonas, '"id"', size=8, color='#7f0000', placement=QgsPalLayerSettings.AroundPoint)
+
+    # Tramos km/carril del proyecto (desactivada por defecto en el mapa)
+    tramos.setRenderer(QgsCategorizedSymbolRenderer('carril', [
+        QgsRendererCategory('D', QgsLineSymbol.createSimple({'color': '#e31a1c', 'width': '0.3',
+                                                             'line_style': 'dash'}), 'Tramo proyecto D'),
+        QgsRendererCategory('I', QgsLineSymbol.createSimple({'color': '#ff7f00', 'width': '0.3',
+                                                             'line_style': 'dash'}), 'Tramo proyecto I')]))
+
+    # Hitos
+    hitos.setRenderer(QgsRuleBasedRenderer(QgsMarkerSymbol.createSimple(
+        {'name': 'square', 'color': '#ffff00', 'size': '3', 'outline_color': '#000000',
+         'outline_width': '0.3'})))
+    _etiquetas(hitos, "'km ' || left(\"hito\", strpos(\"hito\", '+') - 1)", size=10,
+               fondo='#ffff00', placement=QgsPalLayerSettings.OverPoint)
+
+    # Hojas
+    # (no se dibujan en el mapa principal de los planos, solo en el de situación)
+    raiz = QgsRuleBasedRenderer.Rule(None)
+    raiz.appendChild(QgsRuleBasedRenderer.Rule(QgsFillSymbol.createSimple(
+        {'color': '0,0,0,0', 'outline_color': '#2a78d6', 'outline_width': '0.4',
+         'outline_style': 'dash'}), filterExp="coalesce(@map_id, '') <> 'mapa'", label='Hoja'))
+    hojas.setRenderer(QgsRuleBasedRenderer(raiz))
+
+
+def _hojas(eje, cal, crs, zonas_csv, tramos_csv):
+    lyr = _capa_memoria('Polygon', crs, [('hoja', QVariant.Int), ('pk_ini', QVariant.Double),
+                                         ('pk_fin', QVariant.Double), ('titulo', QVariant.String),
+                                         ('resumen', QVariant.String), ('rot', QVariant.Double)])
+    n = int(math.ceil(17.25 / (HOJA_M / 1000)))
+    feats = []
+    for h in range(n):
+        k0, k1 = h * HOJA_M / 1000, min((h + 1) * HOJA_M / 1000, 17.25)
+        d0, d1 = cal.dist(k0), cal.dist(k1)
+        g = _franja(eje, d0, d1, 25, -25)
+        lineas = []
+        for c in ('D', 'I'):
+            zs = [z for z in zonas_csv if z['carril'] == c
+                  and float(z['pk_fin']) > k0 and float(z['pk_ini']) < k1]
+            sup = sum(float(z['superficie_m2']) for z in zs)
+            lineas.append(f'Carril {c}: {len(zs)} zonas · {_num(sup, 0)} m²')
+        kms = sorted({int(k0), int(min(k1, 17.2499))})
+        for k in kms:
+            ts = {t['carril']: t for t in tramos_csv if int(float(t['pk_ini'])) == k}
+            lineas.append(f'Proyecto km {k}+000: D {_num(float(ts["D"]["longitud_m"]), 0)} m × '
+                          f'{_num(float(ts["D"]["ancho_m"]))} · I {_num(float(ts["I"]["longitud_m"]), 0)} m × '
+                          f'{_num(float(ts["I"]["ancho_m"]))}')
+        f = QgsFeature(lyr.fields())
+        f.setGeometry(g)
+        # giro del mapa para que la carretera quede horizontal con el PK creciendo a la derecha
+        p0, p1 = eje.interpolate(d0).asPoint(), eje.interpolate(d1).asPoint()
+        azimut = math.degrees(math.atan2(p1.x() - p0.x(), p1.y() - p0.y()))
+        f.setAttributes([h + 1, k0, k1, f'PK {_pk(k0)} a {_pk(k1)}', '\n'.join(lineas),
+                         round(90 - azimut, 2)])
+        feats.append(f)
+    lyr.dataProvider().addFeatures(feats)
+    return lyr
+
+
+def _anadir_pnoa(crs):
+    if QgsProject.instance().mapLayersByName('PNOA'):
+        return
+    uri = (f'contextualWMSLegend=0&crs={crs.authid()}&dpiMode=7&featureCount=10&format=image/jpeg'
+           '&layers=OI.OrthoimageCoverage&styles=&url=https://www.ign.es/wms-inspire/pnoa-ma')
+    r = QgsRasterLayer(uri, 'PNOA', 'wms')
+    if r.isValid():
+        QgsProject.instance().addMapLayer(r, False)
+        QgsProject.instance().layerTreeRoot().addLayer(r)   # al final = debajo de todo
+    else:
+        print('AVISO: no se pudo cargar la PNOA (¿sin conexión?). Los planos saldrán sin ortofoto.')
+
+
+def _crear_planos(capas, eje, nombre='Planos fresado HU-5401'):
+    defl, zonas, tramos, hitos, hojas = capas
+    proj = QgsProject.instance()
+    mgr = proj.layoutManager()
+    viejo = mgr.layoutByName(nombre)
+    if viejo:
+        mgr.removeLayout(viejo)
+    lay = QgsPrintLayout(proj)
+    lay.initializeDefaults()
+    lay.setName(nombre)
+    mgr.addLayout(lay)
+    pag = lay.pageCollection().page(0)
+    pag.setPageSize(FORMATO, QgsLayoutItemPage.Landscape)
+    W, H = pag.pageSize().width(), pag.pageSize().height()
+    k = W / 420.0                       # escala de maquetación respecto a A3
+    mm = QgsUnitTypes.LayoutMillimeters
+
+    def colocar(item, x, y, w, h):
+        item.attemptMove(QgsLayoutPoint(x * k, y * k, mm))
+        item.attemptResize(QgsLayoutSize(w * k, h * k, mm))
+        lay.addLayoutItem(item)
+
+    def texto(t, x, y, w, h, size, bold=False, color='#0b0b0b'):
+        lb = QgsLayoutItemLabel(lay)
+        lb.setText(t)
+        fmt = QgsTextFormat()
+        f = QFont('Arial')
+        f.setBold(bold)
+        fmt.setFont(f)
+        fmt.setSize(size * k)
+        fmt.setColor(QColor(color))
+        lb.setTextFormat(fmt)
+        colocar(lb, x, y, w, h)
+        return lb
+
+    atlas = lay.atlas()
+    atlas.setCoverageLayer(hojas)
+    atlas.setEnabled(True)
+    atlas.setHideCoverage(False)
+    atlas.setPageNameExpression("'H' || lpad(\"hoja\", 2, '0')")
+    atlas.setFilenameExpression("'HU5401_hoja_' || lpad(\"hoja\", 2, '0')")
+    n = hojas.featureCount()
+
+    texto('HU-5401 · Rehabilitación del firme PP.KK. 0+000 a 17+250 · Fresado y reposición (5 cm AC16 surf)',
+          10, 6, 300, 8, 13, True)
+    texto(f'[% "titulo" %]   ·   Hoja [% "hoja" %] de {n}', 10, 14, 300, 7, 11, True, '#2a78d6')
+    texto('Zonas propuestas a partir del ensayo HWD (GYA, jul-2025) repartiendo la medición del proyecto '
+          'por km y carril. COMPROBAR EN CAMPO.', 230, 7, 180, 12, 7.5, False, '#52514e')
+
+    mapa = QgsLayoutItemMap(lay)
+    mapa.setFrameEnabled(True)
+    colocar(mapa, 10, 22, 400, 105)
+    mapa.zoomToExtent(hojas.extent())
+    mapa.setAtlasDriven(True)
+    mapa.setAtlasScalingMode(QgsLayoutItemMap.Auto)
+    mapa.setAtlasMargin(0.08)
+    mapa.setId('mapa')
+    mapa.dataDefinedProperties().setProperty(QgsLayoutObject.MapRotation,
+                                             QgsProperty.fromExpression('"rot"'))
+
+    vista = QgsLayoutItemMap(lay)
+    vista.setFrameEnabled(True)
+    colocar(vista, 285, 136, 125, 30)
+    vista.setId('vista')
+    vista.setLayers([hojas])
+    vista.setKeepLayerSet(True)
+    g = QgsGeometry.unaryUnion([f.geometry() for f in hojas.getFeatures()]).boundingBox()
+    g.scale(1.05)
+    vista.zoomToExtent(g)
+    vista.overview().setLinkedMap(mapa)
+    texto('Situación de la hoja', 285, 166.5, 125, 4, 7, False, '#52514e')
+
+    ley = QgsLayoutItemLegend(lay)
+    ley.setTitle('')
+    ley.setLinkedMap(mapa)
+    ley.setAutoUpdateModel(False)
+    raiz = ley.model().rootGroup()
+    raiz.removeAllChildren()
+    for l in (zonas, defl, hitos):
+        raiz.addLayer(l)
+    for estilo, tam in ((QgsLegendStyle.Title, 10), (QgsLegendStyle.Group, 8),
+                        (QgsLegendStyle.Subgroup, 8), (QgsLegendStyle.SymbolLabel, 7.5)):
+        st = QgsLegendStyle(ley.style(estilo))
+        fmt = QgsTextFormat(st.textFormat())
+        fmt.setSize(tam * k)
+        st.setTextFormat(fmt)
+        ley.setStyle(estilo, st)
+    ley.setSymbolHeight(3.5 * k)
+    ley.setResizeToContents(False)
+    colocar(ley, 285, 172, 125, 76)
+
+    texto('[% "resumen" %]', 285, 251, 125, 18, 8, False)
+
+    esc = QgsLayoutItemScaleBar(lay)
+    esc.setStyle('Single Box')
+    esc.setLinkedMap(mapa)
+    esc.setUnits(QgsUnitTypes.DistanceMeters)
+    esc.setNumberOfSegments(4)
+    esc.setNumberOfSegmentsLeft(0)
+    esc.setUnitsPerSegment(25)
+    esc.setUnitLabel('m')
+    colocar(esc, 285, 274, 80, 12)
+    norte = QgsLayoutItemPicture(lay)
+    norte.setPicturePath(':/images/north_arrows/layout_default_north_arrow.svg')
+    norte.setLinkedMap(mapa)
+    norte.setNorthMode(QgsLayoutItemPicture.GridNorth)
+    colocar(norte, 394, 270, 14, 18)
+    texto('PK creciente →   (izquierda: Puebla de Guzmán · derecha: Paymogo)', 10, 128, 200, 5, 8, True, '#52514e')
+
+    tabla = QgsLayoutItemAttributeTable.create(lay)
+    tabla.setVectorLayer(zonas)
+    tabla.setFilterToAtlasFeature(True)
+    tabla.setMaximumNumberOfFeatures(40)
+    cols = []
+    for campo, cab, ancho in (('id', 'Zona', 16), ('carril', 'Carril', 12), ('pk_txt', 'PK inicio – fin', 36),
+                              ('longitud_m', 'Long. (m)', 17), ('ancho_m', 'Ancho (m)', 17),
+                              ('superficie_m2', 'Sup. (m²)', 18), ('defl_max', 'Defl. máx', 16),
+                              ('comprobado', 'Comprobado', 22), ('estado_campo', 'Estado / ajuste', 35),
+                              ('obs', 'Observaciones', 52)):
+        c = QgsLayoutTableColumn(cab)
+        c.setAttribute(campo)
+        c.setWidth(ancho * k)
+        cols.append(c)
+    tabla.setColumns(cols)
+    orden = QgsLayoutTableColumn()
+    orden.setAttribute('pk_ini')
+    orden.setSortOrder(Qt.AscendingOrder)
+    tabla.setSortColumns([orden])
+    tabla.setGridStrokeWidth(0.15)
+    tabla.setCellMargin(0.8 * k)
+    tabla.setEmptyTableBehavior(QgsLayoutItemAttributeTable.ShowMessage)
+    tabla.setEmptyTableMessage('Sin zonas de fresado en esta hoja')
+    for attr in ('headerTextFormat', 'contentTextFormat'):
+        fmt = getattr(tabla, attr)()
+        fmt.setSize(7.5 * k)
+        getattr(tabla, 'set' + attr[0].upper() + attr[1:])(fmt)
+    lay.addMultiFrame(tabla)
+    marco = QgsLayoutFrame(lay, tabla)
+    colocar(marco, 10, 136, 268, 154)
+    tabla.addFrame(marco)
+    return lay
 
 
 def ejecutar(cargar=True):
@@ -232,7 +519,7 @@ def ejecutar(cargar=True):
         f.setGeometry(QgsGeometry.fromPointXY(
             _punto_desplazado(eje, cal.dist(pk), _signo(r['carril']) * ANCHO_CARRIL / 2)))
         f.setAttributes([r['carril'], pk, float(r['pk_obra_km']), int(r['deflexion_mm100']),
-                         int(r['singular_gya']), f'{int(pk)}+{round((pk % 1) * 1000):03d}'])
+                         int(r['singular_gya']), _pk(pk)])
         feats.append(f)
     defl.dataProvider().addFeatures(feats)
 
@@ -240,7 +527,8 @@ def ejecutar(cargar=True):
     zonas = _capa_memoria('Polygon', crs, [
         ('id', S), ('carril', S), ('km', I), ('pk_ini', D), ('pk_fin', D), ('longitud_m', D),
         ('ancho_m', D), ('superficie_m2', D), ('defl_max', I), ('defl_media', I),
-        ('singular_gya', I), ('area_gis_m2', D)])
+        ('singular_gya', I), ('area_gis_m2', D), ('pk_txt', S),
+        ('comprobado', S), ('estado_campo', S), ('obs', S)])
     feats = []
     for r in _leer('zonas_fresado_propuestas.csv'):
         a = float(r['ancho_m'])
@@ -254,7 +542,8 @@ def ejecutar(cargar=True):
         f.setGeometry(g)
         f.setAttributes([r['id'], r['carril'], int(r['km']), float(r['pk_ini']), float(r['pk_fin']),
                          float(r['longitud_m']), a, float(r['superficie_m2']), int(r['defl_max']),
-                         int(r['defl_media']), int(r['singular_gya']), round(g.area(), 1)])
+                         int(r['defl_media']), int(r['singular_gya']), round(g.area(), 1),
+                         f"{_pk(float(r['pk_ini']))} – {_pk(float(r['pk_fin']))}", '', '', ''])
         feats.append(f)
     zonas.dataProvider().addFeatures(feats)
 
@@ -272,6 +561,19 @@ def ejecutar(cargar=True):
         feats.append(f)
     tramos.dataProvider().addFeatures(feats)
 
+    # Marcas de PK cada 100 m (sin los km)
+    marcas = _capa_memoria('Point', crs, [('pk', D), ('pk_txt', S)])
+    feats = []
+    for i in range(1, 173):
+        if i % 10 == 0:
+            continue
+        pk = i / 10
+        f = QgsFeature(marcas.fields())
+        f.setGeometry(QgsGeometry.fromPointXY(_punto_desplazado(eje, cal.dist(pk), 0)))
+        f.setAttributes([pk, _pk(pk)])
+        feats.append(f)
+    marcas.dataProvider().addFeatures(feats)
+
     # Hitos calculados
     hitos = _capa_memoria('Point', crs, [('hito', S), ('dist_eje_m', D)])
     feats = []
@@ -283,16 +585,50 @@ def ejecutar(cargar=True):
         feats.append(f)
     hitos.dataProvider().addFeatures(feats)
 
+    hojas = _hojas(eje, cal, crs, _leer('zonas_fresado_propuestas.csv'),
+                   _leer('tabla_proyecto_km_carril.csv'))
+
     salidas = []
     for i, (lyr, nombre) in enumerate(((defl, 'deflexiones_hwd'), (zonas, 'zonas_fresado'),
-                                       (tramos, 'tramos_proyecto'), (hitos, 'hitos_calculados'))):
+                                       (tramos, 'tramos_proyecto'), (hitos, 'hitos_calculados'),
+                                       (hojas, 'hojas_planos'), (marcas, 'marcas_pk_100m'))):
         salidas.append(_guardar(lyr, gpkg, nombre, i == 0))
     tot = sum(f['area_gis_m2'] for f in salidas[1].getFeatures())
-    print(f'{gpkg}: {salidas[1].featureCount()} zonas, {tot:.0f} m² (proyecto 13.674,5 m²)')
+    print(f'{gpkg}: {salidas[1].featureCount()} zonas, {tot:.0f} m² (proyecto 13.674,5 m²), '
+          f'{salidas[4].featureCount()} hojas')
+    _estilos(*salidas[:5])
+    salidas[5].setRenderer(QgsRuleBasedRenderer(QgsMarkerSymbol.createSimple(
+        {'name': 'circle', 'color': '#ffffff', 'size': '1.6', 'outline_color': '#0b0b0b', 'outline_width': '0.3'})))
+    _etiquetas(salidas[5], '"pk_txt"', size=7, color='#0b0b0b',
+               placement=QgsPalLayerSettings.AroundPoint)
+    for lyr in salidas:
+        lyr.saveStyleToDatabase(lyr.name(), 'HU-5401 fresado', True, '')
     if cargar:
-        _estilos(salidas[0], salidas[1])
-        for lyr in reversed(salidas):
-            QgsProject.instance().addMapLayer(lyr)
+        proj = QgsProject.instance()
+        root = proj.layerTreeRoot()
+        viejo = root.findGroup('HU-5401 fresado')
+        if viejo:
+            root.removeChildNode(viejo)
+        grupo = root.insertGroup(0, 'HU-5401 fresado')
+        titulos = {'deflexiones_hwd': 'Deflexiones HWD (0,01 mm)', 'zonas_fresado': 'Zonas de fresado propuestas',
+                   'tramos_proyecto': 'Medición proyecto km/carril', 'hitos_calculados': 'Hitos (calculados)',
+                   'hojas_planos': 'Hojas de planos', 'marcas_pk_100m': 'PK cada 100 m'}
+        for lyr in (salidas[3], salidas[5], salidas[1], salidas[0], salidas[2], salidas[4]):
+            lyr.setName(titulos[lyr.name()])
+            proj.addMapLayer(lyr, False)
+            nodo = grupo.addLayer(lyr)
+            if lyr is salidas[2]:
+                nodo.setItemVisibilityChecked(False)
+        if ANADIR_PNOA:
+            _anadir_pnoa(crs)
+        if CREAR_PLANOS:
+            lay = _crear_planos(salidas[:5], eje)
+            print(f'Composición "{lay.name()}" creada (Proyecto > Composiciones).')
+            if EXPORTAR_PDF:
+                pdf = os.path.join(os.path.dirname(gpkg), 'planos_fresado_HU5401.pdf')
+                res, err = QgsLayoutExporter.exportToPdf(lay.atlas(), pdf,
+                                                         QgsLayoutExporter.PdfExportSettings())
+                print(f'PDF: {pdf}' if res == QgsLayoutExporter.Success else f'Error PDF: {err}')
     return salidas
 
 
